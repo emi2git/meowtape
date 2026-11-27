@@ -1,4 +1,6 @@
-# Emi MP3
+# meowtape
+
+*A mixtape made by the cat — pressed, trimmed and labelled, no humans required.*
 
 Small macOS tools that get music and audiobooks into plain mp3 folders for
 kids' devices: record songs from Spotify and episodes from Ximalaya
@@ -48,9 +50,9 @@ Card folder names must make sense on their own ("Vietnamese 2000s", not
 ## Install
 
 ```sh
-git clone https://github.com/emi2git/emi-mp3 ~/git/apps/emi-mp3
-~/git/apps/emi-mp3/build.sh          # swiftc → bin/blackrec, bin/audiodev, bin/mediakey; .venv for Python
-export PATH="$HOME/git/apps/emi-mp3/bin:$PATH"
+git clone https://github.com/emi2git/meowtape ~/git/apps/meowtape
+~/git/apps/meowtape/build.sh          # swiftc → bin/blackrec, bin/audiodev, bin/mediakey; .venv for Python
+export PATH="$HOME/git/apps/meowtape/bin:$PATH"
 ```
 
 `mp3` with no arguments jumps to the music folder only through a shell

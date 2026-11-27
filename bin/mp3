@@ -316,12 +316,13 @@ _mp3_peak() {
 }
 
 _mp3_rec() {
-  local fmt=mp3 mode=hear
+  local fmt=mp3 mode=silent
   while [[ $1 == --* ]]; do
     case $1 in
       --flac)   fmt=flac ;;
       --wav)    fmt=wav ;;
       --silent) mode=silent ;;
+      --loud|--monitor|--hear) mode=hear ;;
       *) echo "unknown option $1" >&2; return 1 ;;
     esac
     shift
@@ -1535,10 +1536,13 @@ ${b}mp3 rec${r} — record whatever this Mac is playing
 
   ${b}mp3 rec [name]${r}
 
-Captures the system audio — anything you can hear, from any app. Press
-${b}Return${r} (or Ctrl-C) to stop. Without a name the file is timestamped.
+Captures the system audio — anything any app plays. Press ${b}Return${r} (or
+Ctrl-C) to stop. Without a name the file is timestamped.
 
-  ${d}--silent${r}          record without playing it through the speakers
+Silent by default: the sound goes to BlackHole only, nothing comes out of the
+speakers, and the output device is put back when it stops.
+
+  ${d}--loud${r} ${d}--monitor${r}   also play it through the speakers while it records
   ${d}--flac${r} ${d}--wav${r}      lossless instead of 320 kbps mp3
 
 ${b}Examples${r}
@@ -1666,7 +1670,7 @@ ${b}Record from Ximalaya${r}
 
 ${b}Record anything else${r}
   ${b}mp3 rec${r} [name]         capture whatever this Mac is playing,
-                        ${d}Return to stop${r}
+                        ${d}silently — Return to stop${r}
 
 ${b}Download${r}
   ${b}mp3 get${r} <url>          download a song from YouTube and friends
@@ -1682,7 +1686,7 @@ ${b}Tidy up${r}
   ${b}mp3 dir${r}                print where that is
 
 ${b}Common flags${r}
-  ${d}--silent / --hear${r}      whether it plays out loud while recording
+  ${d}--hear / --loud${r}        also play it out loud (default: silent)
   ${d}--flac${r} ${d}--wav${r}           lossless instead of 320 kbps mp3
 
 ${b}Examples${r}

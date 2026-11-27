@@ -75,7 +75,7 @@ mp3 songs                    # paste link after link; q to finish
 mp3 album "https://open.spotify.com/album/<id>"      # every song, skips ones you have
 mp3 playlist "https://open.spotify.com/playlist/<id>"
 mp3 mala  "https://xima.tv/<code>"                   # every Ximalaya episode, via its app
-mp3 rec --silent [name]      # whatever the Mac plays, Return to stop
+mp3 rec [name]               # whatever the Mac plays, silently; Return to stop (--loud to monitor)
 mp3 get   "<youtube url>"    # download best audio as mp3
 mp3 check [file|dir]         # ★ quality rating (320 kbps / lossless = 5 stars)
 mp3 cut   <file> 12          # lossless split into 12 equal parts

@@ -1,0 +1,59 @@
+#!/bin/zsh
+# Enumerate the tracks of Spotify's current playing context.
+#
+# Spotify's AppleScript dictionary has no "playlist tracks" property, so the
+# only way to see the queue is to walk it with `next track` and read `current
+# track` each time. Walking is done while paused, and the player is returned to
+# the track it started on. Prints TSV: id, name, artist, album, duration_ms.
+set -e
+[[ $1 == (-h|--help) ]] && { sed -n '2,7p' ${0:A} | cut -c3-; exit 0 }
+
+osascript <<'APPLESCRIPT'
+on esc(theText)
+  set theText to theText as text
+  set AppleScript's text item delimiters to tab
+  set parts to text items of theText
+  set AppleScript's text item delimiters to " "
+  set theText to parts as text
+  set AppleScript's text item delimiters to ""
+  return theText
+end esc
+
+tell application "Spotify"
+  if not running then error "Spotify is not running"
+  set wasState to player state as text
+  set wasPos to player position
+  set startId to id of current track
+  if wasState is "playing" then pause
+
+  set seenIds to {}
+  set outLines to {}
+  set finished to false
+  repeat 500 times
+    set tId to id of current track
+    -- looped back to a track we already logged: the playlist has wrapped
+    if seenIds contains tId then
+      set finished to true
+      exit repeat
+    end if
+    set end of seenIds to tId
+    set theLine to tId & tab & my esc(name of current track) & tab & ¬
+      my esc(artist of current track) & tab & my esc(album of current track) & tab & ¬
+      ((duration of current track) as text)
+    set end of outLines to theLine
+    next track
+    delay 0.35
+  end repeat
+
+  -- put the player back where we found it
+  play track startId
+  delay 0.4
+  pause
+  set player position to wasPos
+
+  set AppleScript's text item delimiters to linefeed
+  set theResult to outLines as text
+  set AppleScript's text item delimiters to ""
+  return theResult
+end tell
+APPLESCRIPT

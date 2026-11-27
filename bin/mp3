@@ -1,0 +1,1769 @@
+#!/bin/zsh
+# ── mp3 toolkit ──────────────────────────────────────────────
+# Record, download and tidy up music. See `mp3 help` for the user-facing docs —
+# they live in _mp3_help at the bottom of this file, so they only exist once.
+#
+# Layout:
+#   _mp3_rate_one                   quality rating
+#   _mp3_cut / _mp3_trimtop         lossless splitting and topping
+#   _mp3_edit                       browser editor (src/mp3edit)
+#   _mp3_sheet                      lead sheet from a song (src/sheet)
+#   capture plumbing                routing, encoding, wake lock
+#   _mp3_rec                        record the system output mix
+#   _mp3_capture_track              record one Spotify track (shared)
+#   _mp3_song / _mp3_songs          one link / a queue of links
+#   _mp3_collection                 every song on an album or playlist link
+#   _mp3_mala                       every episode of a Ximalaya album (via its app)
+#   _mp3_help                       all the help text
+
+setopt no_nomatch extended_glob
+zmodload zsh/datetime          # $EPOCHREALTIME — sub-second wall clock
+
+# where everything lands (override with MP3_DIR=… for a scratch folder)
+MP3_DIR=${MP3_DIR:-$HOME/Library/CloudStorage/SynologyDrive-SynologySync/mp3}
+
+# this project: bin/ (entry points + built Swift tools) and src/ (helpers)
+_MP3_HOME=${0:A:h:h}
+# Python for `mp3 sheet` — needs demucs + basic-pitch + librosa
+MP3_SHEET_PY=${MP3_SHEET_PY:-$HOME/git/scripts/leadsheet/.venv/bin/python}
+
+# rate one file -> prints the star line (with optional label prefix)
+_mp3_rate_one() {
+  local f="$1" label="$2" codec br kbps stars rating note
+  codec=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 "$f")
+  br=$(ffprobe -v error -select_streams a:0 -show_entries stream=bit_rate -of csv=p=0 "$f")
+  [[ -z $br || $br == N/A ]] && br=$(ffprobe -v error -show_entries format=bit_rate -of csv=p=0 "$f")
+  kbps=$(( br / 1000 ))
+  case $codec in
+    flac|alac|wav|pcm*) stars=5; rating="Excellent"; note="CD quality (lossless) — FLAC/WAV/ALAC" ;;
+    *)
+      if   (( kbps >= 320 )); then stars=5; rating="Excellent"; note="best MP3 (320 kbps)"
+      elif (( kbps >= 256 )); then stars=4; rating="Great";     note="256 kbps+"
+      elif (( kbps >= 192 )); then stars=3; rating="Good";      note="192–255 kbps"
+      elif (( kbps >= 128 )); then stars=2; rating="OK";        note="128–191 kbps"
+      else                         stars=1; rating="Low";       note="under 128 kbps"
+      fi ;;
+  esac
+  local filled=$(printf '★%.0s' {1..$stars}) empty=""
+  (( stars < 5 )) && empty=$(printf '☆%.0s' {1..$((5-stars))})
+  echo "${filled}${empty}  ${kbps} kbps — ${rating} (${note})${label:+  ${label}}"
+}
+
+# _mp3_resolve <file> <command>  -> the path to work on
+# Takes the file name the way it was typed: a real path, something in the music
+# folder, or a partial case-insensitive match — first at the top level, then
+# anywhere below it, so an organised album still answers to the song's name.
+# <command> only names the command in the error messages.
+_mp3_resolve() {
+  local arg=$1 label=$2 src=$1
+  [[ -f $src ]] || { [[ -f $MP3_DIR/$src ]] && src=$MP3_DIR/$src }
+  if [[ ! -f $src ]]; then
+    local -a hits
+    hits=($MP3_DIR/(#i)*${arg}*.(mp3|m4a|m4b|flac|wav|aac|ogg)(N))
+    (( ${#hits} )) ||
+      hits=($MP3_DIR/**/(#i)*${arg}*.(mp3|m4a|m4b|flac|wav|aac|ogg)(N))
+    (( ${#hits} == 1 )) && src=$hits[1]
+    if (( ${#hits} > 1 )); then
+      echo "mp3 $label: '$arg' matches ${#hits} files:" >&2
+      printf '  %s\n' ${hits#$MP3_DIR/} >&2
+      return 1
+    fi
+  fi
+  [[ -f $src ]] || { echo "mp3 $label: no such file: $arg" >&2; return 1 }
+  print -r -- "$src"
+}
+
+# a time typed as seconds, m:ss or h:mm:ss -> plain seconds
+_mp3_secs() {
+  local t=$1 total=0 part
+  [[ -n $t ]] || return 1
+  for part in ${(s.:.)t}; do
+    _mp3_is_num "$part" || return 1
+    total=$(( total * 60 + part ))
+  done
+  print -r -- $total
+}
+
+# split "$1" into "$2" equal parts, lossless (stream copy)
+_mp3_cut() {
+  local src parts="$2"
+  src=$(_mp3_resolve "$1" cut) || return 1
+
+  if [[ $parts != <-> ]] || (( parts < 2 )); then
+    echo "mp3 cut: number of parts must be an integer >= 2 (got '${parts:-}')" >&2
+    return 1
+  fi
+
+  local dur seg out base ext
+  dur=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$src")
+  [[ -z $dur || $dur == N/A ]] && { echo "mp3 cut: cannot read duration of $src" >&2; return 1 }
+  seg=$(( dur / parts ))
+
+  base=${${src:t}:r}; ext=${src:e}
+  out=${src:h}/$base
+  mkdir -p "$out" || return 1
+
+  printf 'Cutting %s (%dm%02ds) into %d parts of ~%dm%02ds\n' \
+    "${src:t}" $(( dur / 60 )) $(( dur % 60 )) $parts $(( seg / 60 )) $(( seg % 60 ))
+
+  local i ss dst width=${#parts}
+  for i in {1..$parts}; do
+    ss=$(( (i - 1) * seg ))
+    dst=$out/$(printf "%s - Part %0${width}d.%s" "$base" $i "$ext")
+    ffmpeg -v error -y -ss "$ss" -t "$seg" -i "$src" -c copy -map_metadata 0 \
+      -metadata title="$base - Part $i" -metadata track="$i/$parts" "$dst" \
+      || { echo "mp3 cut: ffmpeg failed on part $i" >&2; return 1 }
+    printf '  %s\n' "${dst:t}"
+  done
+  echo "→ $out"
+}
+
+# Drop the head off a file: write a new one that starts <at> and runs to the end.
+# Lossless (stream copy), and the original is left exactly as it was — the new
+# file sits next to it as "<name> (trimmed)". Rerunning overwrites that copy, so
+# it's cheap to try 12 seconds, listen, and try 14 instead.
+_mp3_trimtop() {
+  local arg=$1 at=$2 src start dur left base ext out
+  [[ -n $arg && -n $at ]] || { echo "usage: mp3 trimtop <file> <seconds>" >&2; return 1 }
+
+  src=$(_mp3_resolve "$arg" trimtop) || return 1
+
+  if ! start=$(_mp3_secs "$at"); then
+    echo "mp3 trimtop: '$at' isn't a time — give seconds (30) or m:ss (1:30)" >&2
+    return 1
+  fi
+  (( start > 0 )) || { echo "mp3 trimtop: the start has to be past 0" >&2; return 1 }
+
+  dur=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$src")
+  _mp3_is_num "$dur" ||
+    { echo "mp3 trimtop: cannot read the length of ${src:t}" >&2; return 1 }
+  dur=${dur%.*}
+  if (( start >= dur )); then
+    printf 'mp3 trimtop: %s is only %s long — nothing left after %s\n' \
+      "${src:t}" "$(_mp3_hms $dur)" "$(_mp3_hms $start)" >&2
+    return 1
+  fi
+  left=$(( dur - start ))
+
+  base=${${src:t}:r}; ext=${src:e}
+  out=${src:h}/$(_mp3_slug "$base (trimmed)").$ext
+  # never let ffmpeg read and write the same file — it would shred the original
+  [[ ${out:A} == ${src:A} ]] &&
+    { echo "mp3 trimtop: that would overwrite the file it's reading" >&2; return 1 }
+
+  ffmpeg -v error -y -ss "$start" -i "$src" -c copy -map_metadata 0 "$out" ||
+    { echo "mp3 trimtop: ffmpeg failed" >&2; return 1 }
+
+  printf 'Trimmed the first %s off %s — %s left\n' \
+    "$(_mp3_hms $start)" "${src:t}" "$(_mp3_hms $left)"
+  echo "→ $out"
+}
+
+# Open the editor in the browser: listen, mark a start and an end, keep or cut
+# that part, save a lossless "(edited)" copy. The server lives in src/mp3edit.
+_mp3_edit() {
+  local src=
+  if [[ -n $1 ]]; then src=$(_mp3_resolve "$1" edit) || return 1; fi
+  python3 $_MP3_HOME/src/mp3edit/server.py "$MP3_DIR" "$src"
+}
+
+# YouTube link or audio file -> lead sheet PDF (melody + chords). The pipeline
+# lives in src/sheet; it runs in $MP3_SHEET_PY, which has demucs + basic-pitch.
+_mp3_sheet() {
+  [[ -n $1 ]] || { echo "usage: mp3 sheet <youtube url | file> [--key G] [--meter 3|4] [--no-lyrics]" >&2; return 1 }
+  local src=$1; shift
+  [[ $src == http* || -f $src ]] || src=$(_mp3_resolve "$src" sheet) || return 1
+  [[ -x $MP3_SHEET_PY ]] || { echo "mp3 sheet: no Python with demucs at $MP3_SHEET_PY — set MP3_SHEET_PY" >&2; return 1 }
+  $MP3_SHEET_PY $_MP3_HOME/src/sheet/sheet.py "$src" "$@" 2>&1 |
+    grep -v -E 'coremltools|tflite|Tensorflow|^WARNING|^(isfinite|shape|dtype):'
+  return ${pipestatus[1]}
+}
+
+# ── capture plumbing (shared by every recording command) ────────────────────
+# System audio is routed through a multi-output device (speakers + BlackHole) so
+# you still hear everything while the BlackHole side is captured; the original
+# output device is restored on exit, even on Ctrl-C.
+#
+# Capture goes through blackrec (native CoreAudio) rather than ffmpeg's
+# avfoundation input, which drops buffers on virtual devices and leaves
+# full-scale clicks under the music (~23 dB more high-band junk, measured).
+_MP3_AUDIODEV=$_MP3_HOME/bin/audiodev
+_MP3_BLACKREC=$_MP3_HOME/bin/blackrec
+_MP3_STATE=~/.cache/mp3-rec-prev-output
+_MP3_MULTI_UID=com.emi2mac.mp3rec.multiout
+
+_mp3_need_bins() {
+  local m missing=()
+  [[ -x $_MP3_AUDIODEV ]] || missing+=audiodev
+  [[ -x $_MP3_BLACKREC ]] || missing+=blackrec
+  (( $#missing )) || return 0
+  echo "missing $_MP3_HOME/bin/(${(j:, :)missing}) — build with:" >&2
+  echo "  $_MP3_HOME/build.sh" >&2
+  return 1
+}
+
+# _mp3_route_on [silent]
+# Route system audio into BlackHole so it can be captured.
+#   default   multi-output device (speakers + BlackHole) — you still hear it
+#   silent    BlackHole only — nothing comes out of the speakers
+# Sets the globals $_mp3_speakers (what to restore) and $_mp3_multi — globals,
+# not stdout, so it can't be called in a subshell where the restore target
+# would be lost.
+_MP3_BLACKHOLE_UID=BlackHole2ch_UID
+_mp3_route_on() {
+  local mode=${1:-hear} prev
+  prev=$($_MP3_AUDIODEV get) || return 1
+  if [[ $prev == $_MP3_MULTI_UID || $prev == $_MP3_BLACKHOLE_UID ]]; then
+    # already routed (a previous run died mid-way) — fall back to the saved device
+    typeset -g _mp3_speakers=$(<$_MP3_STATE 2>/dev/null)
+    [[ -n $_mp3_speakers ]] || typeset -g _mp3_speakers=BuiltInSpeakerDevice
+  else
+    typeset -g _mp3_speakers=$prev
+  fi
+  mkdir -p ${_MP3_STATE:h} "$MP3_DIR"
+  print -r -- "$_mp3_speakers" > $_MP3_STATE
+
+  typeset -g _mp3_multi
+  if [[ $mode == silent ]]; then
+    _mp3_multi=$_MP3_BLACKHOLE_UID
+  else
+    _mp3_multi=$($_MP3_AUDIODEV ensure-multi "$_mp3_speakers") || return 1
+  fi
+  $_MP3_AUDIODEV set "$_mp3_multi" || return 1
+}
+
+# Put the speakers back. This has to be reliable — a missed restore leaves the
+# Mac with no sound at all, so it verifies, retries once, and says so if it
+# still failed. `mp3 speakers` is the manual way out.
+_mp3_route_off() {
+  [[ -n $_mp3_speakers ]] || return 0
+  local now try
+  for try in 1 2; do
+    $_MP3_AUDIODEV set "$_mp3_speakers" 2>/dev/null
+    now=$($_MP3_AUDIODEV get 2>/dev/null)
+    [[ $now == ($_MP3_BLACKHOLE_UID|$_MP3_MULTI_UID) ]] || return 0
+    sleep 0.3
+  done
+  echo "⚠︎  couldn't switch back to the speakers — run:  mp3 speakers" >&2
+  return 1
+}
+
+# Re-assert the capture routing before each song. Between tracks the default
+# output can end up back on the speakers — a device hiccup, or Spotify or
+# macOS reopening its output — and the next song then plays out loud. Cheap to
+# check, so check every time and put it back if it moved.
+_mp3_route_ensure() {
+  [[ -n $_mp3_multi ]] || return 0
+  local now
+  now=$($_MP3_AUDIODEV get 2>/dev/null)
+  [[ $now == $_mp3_multi ]] && return 0
+  $_MP3_AUDIODEV set "$_mp3_multi" 2>/dev/null
+  echo "        (output had slipped back to the speakers — routed again)" >&2
+  return 0
+}
+
+# Keep the Mac awake while recording. Capture is real time, so a sleep mid-song
+# would truncate the file and leave the audio device half-switched.
+#
+# -dimsu, not -ims: on battery macOS ignores -s entirely (PreventSystemSleep is
+# AC-only), and letting the display sleep was enough for the machine to doze off
+# mid-session. -d/-u hold the display and user-active assertions up too.
+# Nothing here survives the lid being closed.
+_mp3_wake_on() {
+  (( ${+commands[caffeinate]} )) || return 0
+  caffeinate -dimsu -w $$ &
+  typeset -g _mp3_caffeine=$!
+}
+
+_mp3_wake_off() {
+  [[ -n $_mp3_caffeine ]] || return 0
+  kill $_mp3_caffeine 2>/dev/null
+  unset _mp3_caffeine
+  return 0
+}
+
+# manual rescue: force the output back to whatever it was before recording
+_mp3_speakers_restore() {
+  local prev
+  prev=$(<$_MP3_STATE 2>/dev/null)
+  [[ -n $prev ]] || prev=BuiltInSpeakerDevice
+  $_MP3_AUDIODEV set "$prev" || return 1
+  echo "sound is back on: $($_MP3_AUDIODEV name "$prev")"
+}
+
+# _mp3_encode <raw> <out> <fmt> <ss|-> <dur|-> [extra ffmpeg args…]
+# 320 kbps CBR is the mp3 ceiling; -compression_level 0 = lame's best algorithm.
+# -ss/-t go before -i so the trim is a plain sample offset into the PCM.
+_mp3_encode() {
+  local raw=$1 out=$2 fmt=$3 ss=$4 dur=$5; shift 5
+  local -a pre=()
+  [[ $ss  != - ]] && pre+=(-ss "$ss")
+  [[ $dur != - ]] && pre+=(-t "$dur")
+  case $fmt in
+    mp3)  ffmpeg -hide_banner -loglevel error "${pre[@]}" -i "$raw" \
+            -c:a libmp3lame -b:a 320k -compression_level 0 -id3v2_version 3 "$@" -y "$out" ;;
+    flac) ffmpeg -hide_banner -loglevel error "${pre[@]}" -i "$raw" \
+            -c:a flac -compression_level 8 -sample_fmt s32 "$@" -y "$out" ;;
+    wav)  ffmpeg -hide_banner -loglevel error "${pre[@]}" -i "$raw" \
+            -c:a pcm_f32le "$@" -y "$out" ;;
+  esac
+}
+
+# peak level of a capture, in dBFS (empty if unreadable)
+_mp3_peak() {
+  ffmpeg -hide_banner -i "$1" -af volumedetect -f null - 2>&1 |
+    sed -n 's/.*max_volume: \(.*\) dB.*/\1/p' | tail -1
+}
+
+_mp3_rec() {
+  local fmt=mp3 mode=hear
+  while [[ $1 == --* ]]; do
+    case $1 in
+      --flac)   fmt=flac ;;
+      --wav)    fmt=wav ;;
+      --silent) mode=silent ;;
+      *) echo "unknown option $1" >&2; return 1 ;;
+    esac
+    shift
+  done
+  local name="$*"
+
+  _mp3_need_bins || return 1
+
+  _mp3_route_on $mode || return 1
+  _mp3_wake_on
+  _mp3_rec_cleanup() { _mp3_wake_off; _mp3_route_off }
+  trap '_mp3_rec_cleanup' EXIT INT TERM HUP
+
+  local base out raw
+  base=${name:-rec-$(date +%Y-%m-%d-%H%M%S)}
+  out="$MP3_DIR/${base%.(mp3|flac|wav)}.$fmt"
+  raw="${TMPDIR:-/tmp}mp3rec-$$.caf"   # CAF, not WAV: no 4 GB size field to guess at
+
+  if [[ $mode == silent ]]; then
+    echo "output → BlackHole only  (you will NOT hear anything while recording)"
+  else
+    echo "output → $($_MP3_AUDIODEV name "$_mp3_multi")  (you still hear everything)"
+  fi
+  echo "recording → $out"
+  echo "press Return (or Ctrl-C) to stop"
+
+  # capture lossless first, encode after — no realtime encoder pressure
+  $_MP3_BLACKREC "$raw"
+
+  _mp3_rec_cleanup
+  trap - EXIT INT TERM HUP
+  [[ -s $raw ]] || { echo "nothing was recorded" >&2; rm -f "$raw"; return 1 }
+
+  local mean
+  mean=$(ffmpeg -hide_banner -i "$raw" -af volumedetect -f null - 2>&1 |
+         sed -n 's/.*mean_volume: \(.*\) dB.*/\1/p')
+  if [[ -n $mean && ${mean%.*} -le -80 ]]; then
+    echo "⚠︎  the capture is silent (mean ${mean} dB) — was the app playing to the system output?"
+  fi
+
+  _mp3_encode "$raw" "$out" "$fmt" - - || { echo "encode failed" >&2; rm -f "$raw"; return 1 }
+  rm -f "$raw"
+
+  echo
+  _mp3_rate_one "$out" "${out:t}"
+  echo "→ $out"
+}
+
+# ── Spotify ─────────────────────────────────────────────────────────────────
+# one-liner into Spotify's AppleScript dictionary: _spot 'pause'
+_spot() { osascript -e 'tell application "Spotify"' -e "$*" -e 'end tell' 2>/dev/null }
+
+# filesystem-safe file name (keeps unicode; only kills what HFS/Finder dislike)
+_mp3_slug() {
+  local s="$1"
+  s=${s//[\/:]/-}                # path separator + the Finder's colon
+  s=${s//[$'\t'$'\n']/ }
+  s=${s//  ##/ }                 # collapse runs of spaces
+  s=${s##[[:space:].]##}         # no leading dots/spaces
+  s=${s%%[[:space:].]##}         # …or trailing ones
+  print -r -- "${s:-track}"
+}
+
+_mp3_hms() { local s=${1:-0}; _mp3_is_num "$s" || s=0; printf '%d:%02d' $(( s / 60 )) $(( s % 60 )) }
+
+# Anything read from Spotify or ffmpeg can come back as text — AppleScript says
+# "missing value" when there's no track, ffmpeg says "-inf" for pure silence,
+# ffprobe says "N/A". Feeding those to (( )) is a fatal math error, so every
+# external number goes through here first.
+_mp3_is_num() { [[ $1 =~ '^[-+]?[0-9]+(\.[0-9]+)?$' ]] }
+
+# ask on the terminal (not stdin — that may be a pipe); prints the answer as
+# typed. Callers comparing against keystrokes should lowercase with ${ans:l}.
+_mp3_ask() {
+  local ans
+  print -n -- "$1" > /dev/tty
+  read -r ans < /dev/tty || ans=q
+  print -r -- "$ans"
+}
+
+# A song's name, straight from the web rather than from Spotify — so a link can
+# be acknowledged by name while a recording is in progress, without disturbing
+# playback. Empty if offline or unknown; callers fall back to the raw link.
+_mp3_track_title() {
+  curl -sf --max-time 3 "https://open.spotify.com/oembed?url=$1" 2>/dev/null |
+    python3 -c 'import json,sys; print(json.load(sys.stdin).get("title",""))' 2>/dev/null
+}
+
+# Take a line the user typed and act on it: queue any song links it contains,
+# or note that they want to stop. Appends to the caller's $queue and may set
+# $quit — both are locals of _mp3_songs, visible here through zsh's dynamic
+# scoping. Safe to call while a recording is running.
+_mp3_queue_line() {
+  local raw="$1" tok name
+  for tok in ${=raw}; do
+    case ${tok:l} in
+      q|quit|exit|stop)
+        quit=1
+        if (( ${#queue} )); then
+          print "  … will stop once the queue is empty (${#queue} still waiting)"
+        else
+          print "  … stopping"
+        fi
+        continue ;;
+    esac
+    if _mp3_spotify_uri "$tok" >/dev/null; then
+      queue+=("$tok")
+      name=$(_mp3_track_title "$tok")
+      if [[ -n $name ]]; then
+        print "  + queued        $name   (${#queue} waiting)"
+      else
+        print "  + queued        (${#queue} waiting)"
+      fi
+    else
+      print "  ✗ not a Spotify song link: $tok"
+    fi
+  done
+}
+
+# Wait until a wall-clock deadline (or until $pid dies), reading the terminal
+# as we go so links pasted mid-recording are queued instead of blocking.
+_mp3_wait_until() {
+  local deadline=$1 pid=$2 line poll=0
+  (( ${_mp3_poll_input:-0} )) && [[ -c /dev/tty ]] && poll=1
+  while (( EPOCHREALTIME < deadline )); do
+    kill -0 $pid 2>/dev/null || break
+    if (( poll )); then
+      # the 0.3 s timeout doubles as the tick, so this doesn't spin
+      IFS= read -t 0.3 -r line < /dev/tty && [[ -n $line ]] && _mp3_queue_line "$line"
+    else
+      sleep 0.3
+    fi
+  done
+}
+
+# _mp3_capture_track <uri> <secs> <out> <fmt> <title> <artist> <album> <track-no> [meter]
+#
+# Record one Spotify track to <out>. Capture starts first (blackrec prints READY
+# when the tap is live), then the track is told to play.
+#
+# Where the song begins in the capture is measured, not guessed: `player
+# position` is read with the clock taken either side of the call, so we know
+# that track time $pos sits at capture time $ta..$tb. Inferring the start from
+# silence used to break on quiet intros — the detected start landed seconds
+# late, which either ran past the end into the next song or lost the ending.
+#
+# With <meter> set, blackrec's live elapsed/level readout is left on screen.
+# Assumes routing is already set up. Prints indented status lines.
+# Returns 0 recorded, 1 failed, 2 interrupted.
+_mp3_capture_track() {
+  local uri=$1 secs=$2 out=$3 fmt=$4 title=$5 artist=$6 album=$7 trackno=$8 meter=$9
+  local raw="${TMPDIR:-/tmp}mp3trk-$$.caf"
+  local rdy="${TMPDIR:-/tmp}mp3trk-$$.ready"
+  local cap bpid k state peak got rc=1 t0 ta tb pos zero deadline
+
+  # generous upper bound only — the capture is stopped precisely below
+  cap=$(( secs + 12 ))
+
+  _mp3_route_ensure          # in case the output slipped back to the speakers
+  rm -f "$raw" "$rdy"
+  if [[ -n $meter ]]; then
+    $_MP3_BLACKREC -d $cap "$raw" > "$rdy" < /dev/null &
+  else
+    $_MP3_BLACKREC -d $cap "$raw" > "$rdy" 2>/dev/null < /dev/null &
+  fi
+  bpid=$!
+  for k in {1..120}; do [[ -s $rdy ]] && break; sleep 0.05; done   # wait for READY
+  if [[ ! -s $rdy ]]; then
+    echo "        capture did not start — is Microphone access granted to your terminal?" >&2
+    kill $bpid 2>/dev/null; wait $bpid 2>/dev/null
+    rm -f "$raw" "$rdy"; return 1
+  fi
+
+  t0=$EPOCHREALTIME                        # capture is live from here
+  _spot "play track \"$uri\"" >/dev/null
+
+  zero=""
+  for k in {1..100}; do
+    ta=$EPOCHREALTIME
+    pos=$(_spot 'return player position')
+    tb=$EPOCHREALTIME
+    state=$(_spot 'return player state as text')
+    if [[ $state == playing ]] && _mp3_is_num "$pos" && (( pos > 0.05 )); then
+      zero=$(( (ta + tb) / 2 - t0 - pos ))
+      break
+    fi
+    sleep 0.05
+  done
+
+  if [[ -z $zero ]]; then
+    echo "        Spotify would not play this track (state: ${state:-unknown})" >&2
+    kill -INT $bpid 2>/dev/null; wait $bpid 2>/dev/null
+    rm -f "$raw" "$rdy"; return 1
+  fi
+  (( zero < 0 )) && zero=0
+
+  # stop as soon as the song is done, so the next one can't bleed into the tail
+  deadline=$(( t0 + zero + secs + 0.4 ))
+  _mp3_wait_until $deadline $bpid
+  _spot 'pause' >/dev/null
+  kill -INT $bpid 2>/dev/null
+  wait $bpid 2>/dev/null
+  rm -f "$rdy"
+  (( ${abort:-0} )) && { rm -f "$raw"; return 2 }
+  [[ -s $raw ]] || { echo "        nothing was captured" >&2; return 1 }
+
+  peak=$(_mp3_peak "$raw")
+  if [[ $peak == -inf ]] || { _mp3_is_num "$peak" && (( peak <= -60 )) }; then
+    echo "        ⚠︎  captured silence (peak ${peak} dB) — is Spotify playing to the system output?" >&2
+    rm -f "$raw"; return 1
+  fi
+
+  # start a hair early rather than risk clipping the first note
+  (( zero > 0.05 )) && zero=$(( zero - 0.05 ))
+  got=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$raw")
+  if _mp3_is_num "$got" && (( got - zero < secs - 0.3 )); then
+    printf '        ⚠︎  capture ran %.1fs short of the track length\n' \
+      $(( secs - (got - zero) )) >&2
+  fi
+
+  local -a tag_track=()
+  [[ -n $trackno ]] && tag_track=(-metadata track="$trackno")
+  if _mp3_encode "$raw" "$out" "$fmt" "$zero" "$secs" \
+       -metadata title="$title" \
+       -metadata artist="$artist" \
+       -metadata album="$album" \
+       "${tag_track[@]}"; then
+    printf '  ✓ done          %s   (peak %s dB)\n' "${out:t}" "${peak:-?}"
+    rc=0
+  else
+    echo "        encode failed" >&2
+  fi
+  rm -f "$raw"
+  return $rc
+}
+
+# a Spotify track link (or URI) -> spotify:track:<id>
+_mp3_spotify_uri() {
+  local u=${1%%\?*}                       # drop the ?si=… tracking suffix
+  case $u in
+    spotify:track:*)   print -r -- "$u" ;;
+    *open.spotify.com/*track/*)           # handles /intl-xx/track/ too
+                       print -r -- "spotify:track:${u##*/track/}" ;;
+    *) return 1 ;;
+  esac
+}
+
+# _mp3_record_link <link> <fmt> <dest> [meter]
+# Resolve a Spotify song link, ask Spotify what it is, and record it.
+# Assumes routing is already set up.
+# Returns 0 recorded, 1 failed, 2 interrupted, 3 already had it.
+_mp3_record_link() {
+  local link=$1 fmt=$2 dest=$3 meter=$4
+  local uri title artist album secs out trackno tagno num legacy
+
+  if ! uri=$(_mp3_spotify_uri "$link"); then
+    echo "  ✗ not a Spotify song link: $link" >&2
+    echo "    (song links only — album and playlist links aren't supported)" >&2
+    return 1
+  fi
+
+  # ask Spotify what this track is: cue it, read the metadata, stop again.
+  # Nothing is audible — the output is routed away from the speakers.
+  _spot "play track \"$uri\"" >/dev/null
+  sleep 0.8
+  title=$(_spot 'return name of current track')
+  artist=$(_spot 'return artist of current track')
+  album=$(_spot 'return album of current track')
+  secs=$(_spot 'return duration of current track')
+  trackno=$(_spot 'return track number of current track')
+  _spot 'pause' >/dev/null
+  if [[ -z $title || -z $secs ]]; then
+    echo "  ✗ Spotify could not open that link" >&2
+    return 1
+  fi
+  if ! _mp3_is_num "$secs"; then
+    echo "  ✗ Spotify gave no length for that track (got: ${secs:-nothing})" >&2
+    return 1
+  fi
+  (( secs > 3600 )) && secs=$(( secs / 1000 ))
+
+  # "05 Title - Artist" — the number is the song's place on its own album, so a
+  # folder of recordings sorts the way the record plays instead of alphabetically.
+  # Anything Spotify gives no number for keeps the plain "Title - Artist".
+  tagno=""; num=""
+  if _mp3_is_num "$trackno" && (( trackno > 0 )); then
+    tagno=$trackno
+    num=$(printf '%02d ' $trackno)
+  fi
+
+  out="$dest/$(_mp3_slug "${num}$title - $artist").$fmt"
+  legacy="$dest/$(_mp3_slug "$title - $artist").$fmt"
+  # recordings made before the number was part of the name still count as "have it"
+  if [[ -s $out ]] || { [[ -n $num && -s $legacy ]] }; then
+    printf '  • already have  %s — %s\n' "$title" "$artist"
+    return 3
+  fi
+  printf '  ♪ recording     %s — %s  (%s)%s\n' "$title" "$artist" "$(_mp3_hms $secs)" \
+    "$( (( ${_mp3_poll_input:-0} )) && print -n '   … you can keep pasting links' )"
+
+  _mp3_capture_track "$uri" "$secs" "$out" "$fmt" "$title" "$artist" "$album" "$tagno" "$meter"
+}
+
+# open a recording session: route audio away from the speakers, turn Spotify up,
+# and put it all back on the way out.
+_mp3_session_start() {
+  local mode=$1
+  _mp3_need_bins || return 1
+  pgrep -qx Spotify || { echo "Spotify is not running" >&2; return 1 }
+  mkdir -p "$MP3_DIR" || return 1
+
+  _mp3_route_on $mode || return 1
+  _mp3_wake_on
+  typeset -g _mp3_sess_vol
+  _mp3_sess_vol=$(_spot 'return sound volume')
+  _spot 'pause' >/dev/null
+  # turn Spotify up so the capture uses the full scale. Note the explicit
+  # return: without it, an already-at-100 volume makes this the last statement
+  # and its false test becomes the function's exit status.
+  _mp3_is_num "$_mp3_sess_vol" && (( _mp3_sess_vol < 100 )) &&
+    _spot 'set sound volume to 100' >/dev/null
+  return 0
+}
+
+_mp3_session_end() {
+  _mp3_wake_off
+  _spot 'pause' >/dev/null
+  _mp3_is_num "$_mp3_sess_vol" && _spot "set sound volume to $_mp3_sess_vol" >/dev/null
+  _mp3_route_off || return 1
+  # say it out loud: the whole point is that sound comes back
+  [[ -n $_mp3_speakers ]] &&
+    echo "sound is back on: $($_MP3_AUDIODEV name "$_mp3_speakers" 2>/dev/null)"
+  return 0
+}
+
+# Record one or more songs from Spotify links -> "Title - Artist.mp3".
+# Silent by default: routes audio to BlackHole only, so nothing plays out loud.
+_mp3_song() {
+  local fmt=mp3 mode=silent
+  local -a links
+  while (( $# )); do
+    case $1 in
+      --flac) fmt=flac ;;
+      --wav)  fmt=wav ;;
+      --hear) mode=hear ;;
+      --*)    echo "unknown option $1" >&2; return 1 ;;
+      *)      links+=("$1") ;;
+    esac
+    shift
+  done
+  (( $#links )) || { echo "usage: mp3 song [--hear] <spotify-link>…" >&2; return 1 }
+
+  _mp3_session_start $mode || return 1
+  local abort=0
+  trap '_mp3_session_end' EXIT TERM HUP
+  trap 'abort=1' INT
+
+  local link done_n=0 fail_n=0
+  for link in $links; do
+    (( abort )) && break
+    _mp3_record_link "$link" "$fmt" "$MP3_DIR" 1
+    case $? in
+      0) (( done_n++ )) ;;
+      2) break ;;
+      3) ;;
+      *) (( fail_n++ )) ;;
+    esac
+  done
+
+  _mp3_session_end
+  trap - EXIT INT TERM HUP
+  (( fail_n )) && printf '\n%d recorded, %d failed → %s\n' $done_n $fail_n "$MP3_DIR"
+  return 0
+}
+
+# _mp3_embed_tracks <kind> <id>   ->  TSV: uri, title, artist
+# Spotify's embed page carries its track list as data, so an album or playlist
+# can be enumerated without an API key, a login, or touching the Spotify app —
+# which matters because the app is busy playing whatever we're recording.
+_mp3_embed_tracks() {
+  curl -sf --max-time 20 -A 'Mozilla/5.0' "https://open.spotify.com/embed/$1/$2" 2>/dev/null |
+  python3 -c '
+import json, re, sys
+h = sys.stdin.read()
+m = re.search(r"<script id=\"__NEXT_DATA__\"[^>]*>(.*?)</script>", h, re.S)
+if not m:
+    sys.exit(1)
+def walk(o):
+    if isinstance(o, dict):
+        if "trackList" in o:
+            return o["trackList"]
+        for v in o.values():
+            r = walk(v)
+            if r: return r
+    elif isinstance(o, list):
+        for v in o:
+            r = walk(v)
+            if r: return r
+tl = walk(json.loads(m.group(1))) or []
+for t in tl:
+    uri = (t.get("uri") or "")
+    if not uri.startswith("spotify:track:"):
+        continue
+    title  = (t.get("title") or "").replace("\t", " ")
+    artist = (t.get("subtitle") or "").replace("\t", " ")
+    print("\t".join((uri, title, artist)))
+' 2>/dev/null
+}
+
+# _mp3_collection_id <album|playlist> <link>  -> the bare id
+_mp3_collection_id() {
+  local kind=$1 u=${2%%\?*}
+  case $u in
+    spotify:$kind:*)            print -r -- "${u##*:}" ;;
+    *open.spotify.com/*$kind/*) print -r -- "${u##*/$kind/}" ;;
+    *) return 1 ;;
+  esac
+}
+
+# Record every song in an album or playlist, one at a time, each named
+# "05 Title - Artist.mp3". Albums and playlists differ only in the word used —
+# the embed page hands back a track list either way — so they share this.
+# _mp3_collection <album|playlist> [--hear] [--flac|--wav] <link>
+_mp3_collection() {
+  local kind=$1; shift
+  local fmt=mp3 mode=silent link=""
+  while (( $# )); do
+    case $1 in
+      --flac) fmt=flac ;;
+      --wav)  fmt=wav ;;
+      --hear) mode=hear ;;
+      --*)    echo "unknown option $1" >&2; return 1 ;;
+      *)      link=$1 ;;
+    esac
+    shift
+  done
+  [[ -n $link ]] || { echo "usage: mp3 $kind [--hear] <spotify-$kind-link>" >&2; return 1 }
+
+  local id
+  if ! id=$(_mp3_collection_id "$kind" "$link"); then
+    echo "not a Spotify $kind link: $link" >&2
+    echo "  (for a single song use 'mp3 song', for a pile of links 'mp3 songs')" >&2
+    return 1
+  fi
+
+  echo "reading the $kind…"
+  local tsv
+  tsv=$(_mp3_embed_tracks "$kind" "$id")
+  if [[ -z $tsv ]]; then
+    echo "couldn't read that $kind — is it public? check the link" >&2
+    return 1
+  fi
+
+  local -a uris titles artists
+  local u t a
+  while IFS=$'\t' read -r u t a; do
+    [[ -n $u ]] || continue
+    uris+=("$u"); titles+=("$t"); artists+=("$a")
+  done <<< "$tsv"
+
+  local n=${#uris} i
+  (( n )) || { echo "no songs found in that $kind" >&2; return 1 }
+
+  local b d r
+  if [[ -t 1 ]]; then b=$'\e[1m'; d=$'\e[2m'; r=$'\e[0m'; else b=; d=; r=; fi
+
+  print
+  for i in {1..$n}; do
+    printf '%3d. %-46.46s %s\n' $i "${titles[i]}" "${artists[i]}"
+  done
+  printf '\n%s%d songs%s — recorded one at a time, in real time\n' "$b" $n "$r"
+  (( n >= 100 )) &&
+    print "${d}note: Spotify's embed caps at ~100 songs, so a longer $kind may be cut short${r}"
+  if [[ $mode == silent ]]; then
+    print "${d}nothing plays out loud; this Mac stays awake until it finishes${r}"
+  fi
+  print
+  local ans
+  ans=$(_mp3_ask 'start? [Y/n] ')
+  [[ ${ans:l} == (n|no|q) ]] && { echo "cancelled"; return 0 }
+  print
+
+  _mp3_session_start $mode || return 1
+  local abort=0
+  trap '_mp3_session_end' EXIT TERM HUP
+  trap 'abort=1' INT
+
+  local done_n=0 fail_n=0 skip_n=0
+  for i in {1..$n}; do
+    (( abort )) && break
+    printf '%s[%d/%d]%s\n' "$b" $i $n "$r"
+    _mp3_record_link "${uris[i]}" "$fmt" "$MP3_DIR"
+    case $? in
+      0) (( done_n++ )) ;;
+      2) break ;;
+      3) (( skip_n++ )) ;;
+      *) (( fail_n++ )) ;;
+    esac
+  done
+
+  _mp3_session_end
+  trap - EXIT INT TERM HUP
+
+  print
+  printf '%s%d recorded%s' "$b" $done_n "$r"
+  (( skip_n )) && printf ', %d already had' $skip_n
+  (( fail_n )) && printf ', %d failed' $fail_n
+  printf ' → %s\n' "$MP3_DIR"
+  (( abort )) && print "stopped early — rerun the same command to pick up the rest"
+  return 0
+}
+
+_mp3_album()    { _mp3_collection album    "$@" }
+_mp3_playlist() { _mp3_collection playlist "$@" }
+
+# A recording session you feed links to one at a time. Paste a link, it records
+# that song and reports, then asks for the next. The speakers stay off for the
+# whole session, so nothing plays out loud while you work.
+_mp3_songs() {
+  local fmt=mp3 mode=silent
+  local -a pending
+  while (( $# )); do
+    case $1 in
+      --flac) fmt=flac ;;
+      --wav)  fmt=wav ;;
+      --hear) mode=hear ;;
+      --*)    echo "unknown option $1" >&2; return 1 ;;
+      *)      pending+=("$1") ;;      # links given up front go first
+    esac
+    shift
+  done
+
+  _mp3_session_start $mode || return 1
+  local abort=0
+  trap '_mp3_session_end' EXIT TERM HUP
+  trap 'abort=1' INT
+
+  local b d r
+  if [[ -t 1 ]]; then b=$'\e[1m'; d=$'\e[2m'; r=$'\e[0m'; else b=; d=; r=; fi
+
+  print "${b}Recording session${r}"
+  print "  saving to  $MP3_DIR"
+  if [[ $mode == silent ]]; then
+    print "  speakers   ${d}off for the whole session — you won't hear a thing${r}"
+  else
+    print "  speakers   ${d}on — each song plays as it records${r}"
+  fi
+  print "  sleep      ${d}blocked — this Mac stays awake until the session ends${r}"
+  print "  ${d}paste song links whenever you like — including while one is${r}"
+  print "  ${d}recording. They queue up and record in order. q when you're done.${r}"
+
+  # Links go into a queue and are recorded one at a time. While a song is
+  # recording, the terminal is still read (see _mp3_wait_polling), so more
+  # links can be pasted at any moment — they're acknowledged and queued, and
+  # the queue drains in order.
+  local line link quit=0 done_n=0 fail_n=0 skip_n=0
+  local -a queue
+  (( ${#pending} )) && _mp3_queue_line "${pending[*]}"
+  _mp3_poll_input=1
+
+  while true; do
+    (( abort )) && break
+
+    if (( ! ${#queue} )); then
+      (( quit )) && break
+      print
+      line=$(_mp3_ask "${b}[$done_n done]${r} link ▸ ")
+      _mp3_queue_line "$line"
+      continue
+    fi
+
+    link=$queue[1]; queue=("${(@)queue[2,-1]}")
+    _mp3_record_link "$link" "$fmt" "$MP3_DIR"
+    case $? in
+      0) (( done_n++ )) ;;
+      2) abort=1 ;;
+      3) (( skip_n++ )) ;;
+      *) (( fail_n++ )) ;;
+    esac
+  done
+  _mp3_poll_input=0
+
+  _mp3_session_end
+  trap - EXIT INT TERM HUP
+
+  print
+  printf '%s%d recorded%s' "$b" $done_n "$r"
+  (( skip_n )) && printf ', %d already had' $skip_n
+  (( fail_n )) && printf ', %d failed' $fail_n
+  printf ' → %s\n' "$MP3_DIR"
+  return 0
+}
+
+
+# ── Ximalaya (喜马拉雅) ──────────────────────────────────────────────────────
+# `mp3 mala <album link>` — the same idea as `mp3 album`, for Ximalaya.
+#
+# The Ximalaya desktop app has no AppleScript dictionary, but it does register
+# the iting:// deep link, so each episode can be started by id — and it does
+# register the media keys, so it can be paused between episodes (see
+# bin/mediakey). Playback goes out through BlackHole and is captured the same
+# way the Spotify side captures a song.
+#
+# Where a song's start could be read straight off Spotify's clock, the app tells
+# us nothing, so the start is found in the recording itself: everything before
+# the first sound is the app opening the episode, and the cut begins there.
+#
+# The track list, titles, lengths, author and cover art come from Ximalaya's own
+# JSON over the web — that part works from anywhere, even where the site refuses
+# to hand out the audio itself.
+_MP3_MALA_UA='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
+_MP3_MALA_APP=/Applications/喜马拉雅.app
+_MP3_MEDIAKEY=$_MP3_HOME/bin/mediakey
+MP3_MALA_GENRE=${MP3_MALA_GENRE:-Audiobook}
+
+_mp3_mala_curl() {
+  curl -sf --max-time 25 -A "$_MP3_MALA_UA" -H 'Referer: https://www.ximalaya.com/' "$1"
+}
+
+# <link> -> album id. Follows xima.tv/短链 redirects, and accepts a link to a
+# single episode by asking the site which album it belongs to.
+_mp3_mala_id() {
+  local link=$1 url id
+  [[ $link == <-> ]] && { print -r -- "$link"; return 0 }      # a bare id
+  [[ $link == http*://* ]] || link="https://$link"
+  url=$(curl -sfI -o /dev/null -w '%{url_effective}' -L --max-time 20 \
+        -A "$_MP3_MALA_UA" "$link" 2>/dev/null) || url=$link
+  url=${url%%\?*}
+  case $url in
+    */album/*)  id=${url##*/album/}; id=${id%%/*} ;;
+    */sound/*)  id=$(_mp3_mala_track_album "${${url##*/sound/}%%/*}") ;;
+    *)          id=${url##*/}; id=${id%%/*} ;;                 # …/<category>/<id>
+  esac
+  [[ $id == <-> ]] || return 1
+  print -r -- "$id"
+}
+
+# episode id -> the id of the album it sits in
+_mp3_mala_track_album() {
+  _mp3_mala_curl "https://www.ximalaya.com/revision/track/trackPageInfo?trackId=$1" |
+  python3 -c '
+import json, sys
+def walk(o):
+    if isinstance(o, dict):
+        if isinstance(o.get("albumId"), int): return o["albumId"]
+        for v in o.values():
+            r = walk(v)
+            if r: return r
+    elif isinstance(o, list):
+        for v in o:
+            r = walk(v)
+            if r: return r
+print(walk(json.load(sys.stdin)) or "")
+' 2>/dev/null
+}
+
+# _mp3_mala_meta <album id>
+# One "#ALBUM" line — title, author, cover, year, episode count, blurb — then
+# one line per episode: number, id, title, seconds, year. All TSV, in the order
+# the album plays (the site lists newest first). Empty fields come back as "-",
+# because zsh's read swallows a run of tabs.
+_mp3_mala_meta() {
+  python3 - "$1" "$_MP3_MALA_UA" <<'PY' 2>/dev/null
+import json, sys, urllib.request
+
+album, ua = sys.argv[1], sys.argv[2]
+def get(u):
+    r = urllib.request.Request(u, headers={"User-Agent": ua, "Referer": "https://www.ximalaya.com/"})
+    return json.load(urllib.request.urlopen(r, timeout=25))
+
+def clean(s):
+    return " ".join(str(s or "").split())
+
+info = get("https://www.ximalaya.com/revision/album/v1/simple?albumId=%s" % album)
+main = (info.get("data") or {}).get("albumPageMainInfo") or {}
+
+tracks, page = [], 1
+while page <= 200:
+    p = get("https://mobile.ximalaya.com/mobile/playlist/album/page"
+            "?albumId=%s&pageSize=100&pageId=%d" % (album, page))
+    got = p.get("list") or []
+    tracks += got
+    if not got or page >= (p.get("maxPageId") or 1):
+        break
+    page += 1
+if not tracks:
+    sys.exit(1)
+
+# the album's own order: orderNo counts up from the first episode
+tracks.sort(key=lambda t: (t.get("orderNo") or 0, t.get("createdAt") or 0))
+
+author = ""
+uid = tracks[0].get("uid")
+if uid:
+    try:
+        author = clean((get("https://www.ximalaya.com/revision/user/basic?uid=%s" % uid)
+                        .get("data") or {}).get("nickName"))
+    except Exception:
+        pass
+
+cover = main.get("cover") or tracks[0].get("coverLarge") or ""
+if cover.startswith("//"):
+    cover = "https:" + cover
+year = (main.get("createDate") or "")[:4]
+
+def row(*f):
+    print("\t".join(x or "-" for x in f))
+
+row("#ALBUM", clean(main.get("albumTitle")) or "Ximalaya %s" % album,
+    author, cover, year, str(len(tracks)), clean(main.get("shortIntro")))
+for i, t in enumerate(tracks, 1):
+    ms = t.get("createdAt") or 0
+    y = str(1970 + ms // 31556952000) if ms else year
+    row(str(i), str(t.get("trackId")), clean(t.get("title")),
+        str(t.get("duration") or 0), y)
+PY
+}
+
+# ── driving the app ─────────────────────────────────────────────────────────
+_mp3_mala_app_start() {
+  [[ -d $_MP3_MALA_APP ]] || {
+    echo "the 喜马拉雅 app isn't in /Applications — mp3 mala plays through it" >&2
+    return 1
+  }
+  open -ga "$_MP3_MALA_APP" || return 1
+  local k
+  for k in {1..40}; do
+    pgrep -qf "$_MP3_MALA_APP:t:r" && return 0
+    sleep 0.25
+  done
+  return 0
+}
+
+# Open one episode, by id — the app's own deep link, so it lands on exactly this
+# one however deep in the album it sits. It only opens it: playing is a separate
+# press of the play key.
+_mp3_mala_open() { open -g "iting://open?msg_type=11&track_id=$1" 2>/dev/null }
+
+# Press play/pause. The app takes this whether or not it's in front; so does
+# Spotify, if it's open, which is why it gets put straight back to sleep through
+# its own AppleScript.
+_mp3_mala_key() {
+  $_MP3_MEDIAKEY play 2>/dev/null
+  if pgrep -qx Spotify; then
+    sleep 0.2
+    _spot 'pause' >/dev/null
+  fi
+  return 0
+}
+
+# The loudest thing blackrec has heard lately, in dBFS, read off its own live
+# meter — which is how we can tell, while it records, whether the app is
+# actually playing or the press missed.
+_mp3_mala_level() {
+  [[ -s $1 ]] || return 1
+  tr '\r' '\n' < "$1" | tail -6 |
+    sed -n 's/.*\] *\(-*[0-9.]*\) dB.*/\1/p' | sort -n | tail -1
+}
+
+# The app answers the media keys, so this is how it's stopped between episodes.
+# Spotify answers them too, if it's open — so it's put straight back to sleep,
+# through its own AppleScript, before the next capture starts.
+# Stop whatever is playing. Only press if something is: the key is a toggle, and
+# a press into silence would start the episode up again behind our back.
+_mp3_mala_pause() {
+  [[ -x $_MP3_MEDIAKEY ]] || return 0
+  _mp3_mala_key
+  return 0
+}
+
+# Everything here runs on that one key press — starting an episode as much as
+# stopping it — and a posted press is dropped in silence when Accessibility
+# isn't granted. So ask first, once, and put the dialog up.
+_mp3_mala_keys_ok() {
+  $_MP3_MEDIAKEY check && return 0
+  $_MP3_MEDIAKEY check ask >/dev/null 2>&1
+  echo "this terminal isn't allowed to press the play key, and that's how the" >&2
+  echo "喜马拉雅 app is started and stopped — its links only open an episode." >&2
+  echo "  tick it once:  System Settings ▸ Privacy & Security ▸ Accessibility" >&2
+  echo "  (a dialog should have just opened; then restart the terminal)" >&2
+  return 1
+}
+
+# Where the episode actually starts in a capture: the end of the silence the
+# app spends opening it. Nothing but silence -> nothing played.
+_mp3_mala_onset() {
+  ffmpeg -hide_banner -i "$1" -af silencedetect=noise=-55dB:d=0.3 -f null - 2>&1 |
+    sed -n 's/.*silence_end: \([0-9.]*\).*/\1/p' | head -1
+}
+
+# _mp3_mala_capture <track id> <secs> <out> <fmt> <cover> <ffmpeg metadata…>
+#
+# Record one episode. The recorder starts first and is given a moment of quiet —
+# which is what the episode's start is measured against later — then the episode
+# is opened and the play key is pressed. A press can land before the app has the
+# episode loaded and do nothing, so this watches blackrec's own meter and presses
+# again until sound actually arrives, rather than assuming it did.
+#
+# Sets $_mp3_mala_took to how long that took, for the progress line.
+# Returns 0 recorded, 1 failed, 2 interrupted.
+_mp3_mala_capture() {
+  local id=$1 secs=$2 out=$3 fmt=$4 cover=$5; shift 5
+  local -a tags=("$@")
+  local raw="${TMPDIR:-/tmp}mp3mala-$$.caf"
+  local rdy="${TMPDIR:-/tmp}mp3mala-$$.ready"
+  local met="${TMPDIR:-/tmp}mp3mala-$$.meter"
+  local quiet=1.2 patience=45 floor=-55
+  local bpid k lvl loud=0 presses=0 since=0 t0 playing=0 onset peak got rc=1
+
+  _mp3_route_ensure
+  rm -f "$raw" "$rdy" "$met"
+  $_MP3_BLACKREC -d $(( quiet + patience + secs + 9 )) "$raw" > "$rdy" 2> "$met" < /dev/null &
+  bpid=$!
+  for k in {1..120}; do [[ -s $rdy ]] && break; sleep 0.05; done
+  if [[ ! -s $rdy ]]; then
+    echo "        capture did not start — is Microphone access granted to your terminal?" >&2
+    kill $bpid 2>/dev/null; wait $bpid 2>/dev/null
+    rm -f "$raw" "$rdy" "$met"; return 1
+  fi
+
+  sleep $quiet                       # the silence the episode's start is measured from
+  t0=$EPOCHREALTIME
+  _mp3_mala_open "$id"
+
+  # Give the app a moment to load the episode, then press play — and keep an eye
+  # on the meter, because a press into a half-loaded window does nothing at all.
+  while (( EPOCHREALTIME - t0 < patience )); do
+    (( ${abort:-0} )) && break
+    kill -0 $bpid 2>/dev/null || break
+    if (( presses == 0 && EPOCHREALTIME - t0 >= 3 )) ||
+       (( presses > 0 && presses < 4 && EPOCHREALTIME - since >= 7 )); then
+      _mp3_mala_key
+      (( presses++ )); since=$EPOCHREALTIME
+    fi
+    lvl=$(_mp3_mala_level "$met")
+    if _mp3_is_num "$lvl" && (( lvl > floor )); then
+      (( loud++ ))
+      (( loud >= 2 )) && { playing=1; break }     # twice over, so a blip isn't enough
+    else
+      loud=0
+    fi
+    sleep 0.5
+  done
+
+  typeset -g _mp3_mala_took=$(( EPOCHREALTIME - t0 ))
+  if (( ! playing )); then
+    (( ${abort:-0} )) || echo "        the app never started playing this episode" >&2
+    _mp3_mala_pause
+    kill -INT $bpid 2>/dev/null; wait $bpid 2>/dev/null
+    rm -f "$raw" "$rdy" "$met"
+    (( ${abort:-0} )) && return 2
+    return 1
+  fi
+
+  # sound is flowing; run out the episode from here, with room to spare
+  _mp3_wait_until $(( EPOCHREALTIME + secs + 6 )) $bpid
+  _mp3_mala_pause
+  kill -INT $bpid 2>/dev/null
+  wait $bpid 2>/dev/null
+  rm -f "$rdy" "$met"
+  (( ${abort:-0} )) && { rm -f "$raw"; return 2 }
+  [[ -s $raw ]] || { echo "        nothing was captured" >&2; return 1 }
+
+  peak=$(_mp3_peak "$raw")
+  if [[ $peak == -inf ]] || { _mp3_is_num "$peak" && (( peak <= -60 )) }; then
+    echo "        ⚠︎  captured silence (peak ${peak} dB) — did the app play this episode?" >&2
+    rm -f "$raw"; return 1
+  fi
+
+  onset=$(_mp3_mala_onset "$raw")
+  if ! _mp3_is_num "$onset"; then
+    echo "        ⚠︎  the recording never went quiet, so the start couldn't be found" >&2
+    echo "           (something else was playing over it)" >&2
+    rm -f "$raw"; return 1
+  fi
+
+  # start a hair early rather than risk clipping the first word
+  (( onset > 0.05 )) && onset=$(( onset - 0.05 ))
+  got=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$raw")
+  if _mp3_is_num "$got" && (( got - onset < secs - 0.3 )); then
+    printf '        ⚠︎  capture ran %.1fs short of the episode length\n' \
+      $(( secs - (got - onset) )) >&2
+  fi
+
+  if _mp3_encode "$raw" "$out" "$fmt" "$onset" "$secs" "${tags[@]}"; then
+    [[ -s $cover ]] && _mp3_mala_art "$out" "$cover"
+    printf '  ✓ done          %s   (peak %s dB)\n' "${out:t}" "${peak:-?}"
+    rc=0
+  else
+    echo "        encode failed" >&2
+  fi
+  rm -f "$raw"
+  return $rc
+}
+
+# put the album art in the file — a second, stream-copy pass, so it works the
+# same for every format _mp3_encode can write
+_mp3_mala_art() {
+  local f=$1 art=$2 tmp="${1:r}.art.${1:e}"
+  ffmpeg -hide_banner -loglevel error -i "$f" -i "$art" \
+    -map 0:a -map 1:v -c:a copy -c:v mjpeg -id3v2_version 3 \
+    -metadata:s:v title="Album cover" -metadata:s:v comment="Cover (front)" \
+    -disposition:v attached_pic -y "$tmp" 2>/dev/null &&
+    mv -f "$tmp" "$f" || rm -f "$tmp"
+  return 0
+}
+
+# Record every episode of a Ximalaya album, one at a time, into a folder of its
+# own — "01 Title.mp3", tagged with the album, the author, the number and the art.
+# _mp3_mala [--hear] [--flac|--wav] [--from n] [--to n] <link>
+_mp3_mala() {
+  local fmt=mp3 mode=silent link="" first=1 last=0 yes=0
+  while (( $# )); do
+    case $1 in
+      --flac)      fmt=flac ;;
+      --wav)       fmt=wav ;;
+      --hear)      mode=hear ;;
+      --from)      first=$2; shift ;;
+      --to)        last=$2; shift ;;
+      -y|--yes)    yes=1 ;;
+      --*|-*)      echo "unknown option $1" >&2; return 1 ;;
+      *)           link=$1 ;;
+    esac
+    shift
+  done
+  [[ -n $link ]] || { echo "usage: mp3 mala [--hear] [--from n] <ximalaya-album-link>" >&2; return 1 }
+
+  _mp3_need_bins || return 1
+  if [[ ! -x $_MP3_MEDIAKEY ]]; then
+    echo "missing $_MP3_HOME/bin/mediakey — build with:" >&2
+    echo "  $_MP3_HOME/build.sh" >&2
+    return 1
+  fi
+
+  [[ -d $_MP3_MALA_APP ]] || {
+    echo "the 喜马拉雅 app isn't in /Applications — mp3 mala plays through it" >&2
+    return 1
+  }
+  _mp3_mala_keys_ok || return 1
+
+  local id
+  if ! id=$(_mp3_mala_id "$link") || [[ -z $id ]]; then
+    echo "that doesn't look like a Ximalaya link: $link" >&2
+    echo "  expected something like https://xima.tv/1_u6dg10w or https://www.ximalaya.com/album/71651569" >&2
+    return 1
+  fi
+
+  echo "reading the album…"
+  local meta
+  meta=$(_mp3_mala_meta "$id")
+  [[ -n $meta ]] || { echo "couldn't read album $id — is it still up? check the link" >&2; return 1 }
+
+  local tag atitle author cover ayear count intro
+  IFS=$'\t' read -r tag atitle author cover ayear count intro <<< "${meta%%$'\n'*}"
+  local f
+  for f in author cover ayear intro; do [[ ${(P)f} == - ]] && typeset -g $f= ; done
+
+  local -a nums ids titles secs years
+  local n i t d y
+  while IFS=$'\t' read -r n i t d y; do
+    [[ $n == <-> ]] || continue
+    [[ $y == - ]] && y=""
+    nums+=("$n"); ids+=("$i"); titles+=("$t"); secs+=("$d"); years+=("$y")
+  done <<< "${meta#*$'\n'}"
+
+  local total=${#ids}
+  (( total )) || { echo "no episodes in that album" >&2; return 1 }
+  (( last > 0 && last < total )) || last=$total
+  (( first >= 1 )) || first=1
+  (( first <= last )) || { echo "--from $first is past the end (${total} episodes)" >&2; return 1 }
+
+  local dest="$MP3_DIR/$(_mp3_slug "$atitle${author:+ - $author}")"
+  local b d2 r
+  if [[ -t 1 ]]; then b=$'\e[1m'; d2=$'\e[2m'; r=$'\e[0m'; else b=; d2=; r=; fi
+
+  local whole=0
+  for i in {$first..$last}; do (( whole += secs[i] )); done
+
+  print
+  print "${b}${atitle}${r}${author:+  ${d2}by ${author}${r}}"
+  [[ -n $intro ]] && print "${d2}${intro}${r}"
+  print
+  for i in {$first..$last}; do
+    printf '%3d. %-52.52s %s\n' ${nums[i]} "${titles[i]}" "$(_mp3_hms ${secs[i]})"
+  done
+  printf '\n%s%d episodes%s, %s in all — recorded one at a time, in real time\n' \
+    "$b" $(( last - first + 1 )) "$r" "$(_mp3_hms $whole)"
+  print "saving to  $dest"
+  print "${d2}played by the 喜马拉雅 app — opened by link, started with the play key;${r}"
+  print "${d2}it's left paused when this finishes${r}"
+  pgrep -qx Spotify &&
+    print "${d2}Spotify answers that key too — it's paused again after every press,${r}
+${d2}but quitting it is calmer${r}"
+  if [[ $mode == silent ]]; then
+    print "${d2}nothing plays out loud; this Mac stays awake until it's done${r}"
+  fi
+
+  print
+  if (( ! yes )); then
+    local ans
+    ans=$(_mp3_ask 'start? [Y/n] ')
+    [[ ${ans:l} == (n|no|q) ]] && { echo "cancelled"; return 0 }
+  fi
+  print
+
+  mkdir -p "$dest" || return 1
+
+  # the art, fetched once for the whole album
+  local art=""
+  if [[ -n $cover ]]; then
+    art="${TMPDIR:-/tmp}mp3mala-art-$$.jpg"
+    curl -sf --max-time 20 -A "$_MP3_MALA_UA" "$cover" -o "$art" 2>/dev/null || art=""
+  fi
+
+  _mp3_mala_app_start || { rm -f "$art"; return 1 }
+  _mp3_route_on $mode || { rm -f "$art"; return 1 }
+  _mp3_wake_on
+  local abort=0
+  _mp3_mala_end() { _mp3_mala_pause; _mp3_wake_off; _mp3_route_off }
+  trap '_mp3_mala_end' EXIT TERM HUP
+  trap 'abort=1' INT
+
+  local done_n=0 fail_n=0 skip_n=0 out
+  _mp3_mala_pause                       # whatever it was doing, stop it
+  sleep 0.6
+  for i in {$first..$last}; do
+    (( abort )) && break
+    printf '%s[%d/%d]%s\n' "$b" ${nums[i]} $total "$r"
+    out="$dest/$(_mp3_slug "$(printf '%02d' ${nums[i]}) ${titles[i]}").$fmt"
+    if [[ -s $out ]]; then
+      printf '  • already have  %s\n' "${titles[i]}"
+      (( skip_n++ )); continue
+    fi
+    printf '  ♪ recording     %s  (%s)\n' "${titles[i]}" "$(_mp3_hms ${secs[i]})"
+    _mp3_mala_took=""
+    _mp3_mala_capture "${ids[i]}" "${secs[i]}" "$out" "$fmt" "$art" \
+      -metadata title="${titles[i]}" \
+      -metadata artist="${author:-喜马拉雅}" \
+      -metadata album_artist="${author:-喜马拉雅}" \
+      -metadata album="$atitle" \
+      -metadata track="${nums[i]}/$total" \
+      -metadata date="${years[i]:-$ayear}" \
+      -metadata genre="$MP3_MALA_GENRE" \
+      -metadata comment="https://www.ximalaya.com/sound/${ids[i]}" \
+      -metadata publisher=喜马拉雅
+    case $? in
+      0) (( done_n++ )) ;;
+      2) break ;;
+      *) (( fail_n++ )) ;;
+    esac
+    sleep 0.8
+  done
+
+  _mp3_mala_end
+  trap - EXIT INT TERM HUP
+  rm -f "$art"
+  [[ -n $_mp3_speakers ]] &&
+    echo "sound is back on: $($_MP3_AUDIODEV name "$_mp3_speakers" 2>/dev/null)"
+
+  print
+  printf '%s%d recorded%s' "$b" $done_n "$r"
+  (( skip_n )) && printf ', %d already had' $skip_n
+  (( fail_n )) && printf ', %d failed' $fail_n
+  printf ' → %s\n' "$dest"
+  (( abort )) && print "stopped early — rerun the same command to pick up the rest"
+  return 0
+}
+
+
+# ── help ────────────────────────────────────────────────────────────────────
+_mp3_help() {
+  local b d r
+  if [[ -t 1 ]]; then b=$'\e[1m'; d=$'\e[2m'; r=$'\e[0m'; else b=; d=; r=; fi
+
+  case $1 in
+    song|track|link) cat <<EOF
+${b}mp3 song${r} — record one song from a Spotify link
+
+  ${b}mp3 song <link>${r}
+
+Spotify tells it the title, artist, length and track number, so the file comes
+out named ${b}"05 Title - Artist.mp3"${r} with the tags already filled in, trimmed to
+start on the music and run exactly as long as the song. The number is the song's
+place on its own album; songs Spotify gives no number for are just
+${b}"Title - Artist.mp3"${r}.
+
+  ${d}--hear${r}            play it through the speakers while it records
+                    ${d}(off by default — you hear nothing)${r}
+  ${d}--flac${r} ${d}--wav${r}      lossless instead of 320 kbps mp3
+
+${b}Examples${r}
+  mp3 song "https://open.spotify.com/track/<track id>"
+  mp3 song --hear "https://open.spotify.com/track/…"
+
+Quote the link — the ${d}?si=${r} on the end confuses the shell otherwise.
+Spotify has to be running, but it doesn't need to be playing anything.
+EOF
+    ;;
+    album) cat <<EOF
+${b}mp3 album${r} — record every song on an album
+
+  ${b}mp3 album <album link>${r}
+
+Reads the album's track list, shows it, and records the songs one at a time,
+each saved as ${b}"05 Title - Artist.mp3"${r} with its tags — numbered so the folder
+sorts the way the record plays. Songs you already have are skipped, so you can
+stop and rerun to pick up the rest.
+
+  ${d}--hear${r}            play the songs out loud as they record
+  ${d}--flac${r} ${d}--wav${r}      lossless instead of 320 kbps mp3
+
+${b}Example${r}
+  mp3 album "https://open.spotify.com/album/<album id>"
+
+The album has to be public. Track lists come from Spotify's web page, not the
+app, so reading it can't disturb anything that's playing. It records in real
+time — a 45 minute album takes 45 minutes.
+EOF
+    ;;
+    playlist|list) cat <<EOF
+${b}mp3 playlist${r} — record every song in a playlist
+
+  ${b}mp3 playlist <playlist link>${r}
+
+The same as ${b}mp3 album${r}, for a playlist: it reads the track list, shows it, and
+records the songs one at a time, each saved as ${b}"05 Title - Artist.mp3"${r} with its
+tags. The number is each song's place on its own album, not its position in the
+playlist. Songs you already have are skipped, so you can stop and rerun to pick
+up the rest.
+
+  ${d}--hear${r}            play the songs out loud as they record
+  ${d}--flac${r} ${d}--wav${r}      lossless instead of 320 kbps mp3
+
+${b}Example${r}
+  mp3 playlist "https://open.spotify.com/playlist/<playlist id>"
+
+The playlist has to be public, and Spotify's embed hands back about 100 songs at
+most — a longer playlist gets cut short, and it says so before it starts. It
+records in real time, so a two hour playlist takes two hours.
+EOF
+    ;;
+    mala|xima|ximalaya) cat <<EOF
+${b}mp3 mala${r} — record every episode of a Ximalaya (喜马拉雅) album
+
+  ${b}mp3 mala <album link>${r}
+
+Reads the album, shows what's in it, then plays and records the episodes one at
+a time into a folder of their own — ${b}"01 Title.mp3"${r}, tagged with the album, the
+author, the episode number, the year and the cover art. Episodes you already
+have are skipped, so you can stop and rerun to pick up the rest.
+
+Nothing comes out of the speakers: like ${b}mp3 album${r}, the sound is routed away
+from them and captured on its way past, so the Mac stays silent while it works.
+
+The 喜马拉雅 app is the player — it has no AppleScript, so each episode is opened
+by its ${d}iting://${r} link and stopped again with the media keys. That needs your
+terminal ticked in ${d}System Settings ▸ Privacy & Security ▸ Accessibility${r}; without it
+the app is quit and reopened between episodes instead, which works just as well
+and costs a couple of seconds each. The app
+is left paused at the end. Track lists come from Ximalaya's website, so reading
+the album never disturbs what's playing.
+
+  ${d}--hear${r}            play the episodes out loud as they record
+  ${d}--from n${r} ${d}--to n${r}   only part of the album
+  ${d}--yes${r}             don't ask before it starts
+  ${d}--flac${r} ${d}--wav${r}      lossless instead of 320 kbps mp3
+  ${d}MP3_MALA_GENRE${r}    the genre tag (default Audiobook)
+
+${b}Examples${r}
+  mp3 mala "https://xima.tv/<code>"
+  mp3 mala --from 12 "https://www.ximalaya.com/album/<album id>"
+
+Short xima.tv links, album links and single-episode links all work. It records
+in real time, so a six hour album takes six hours. Spotify answers the media
+keys too — quit it first if it's running, or it'll skip about while this works.
+EOF
+    ;;
+    songs|queue) cat <<EOF
+${b}mp3 songs${r} — a recording session you feed links to, one at a time
+
+  ${b}mp3 songs${r}
+
+Paste a Spotify song link and press Return. It records that song, tells you how
+it went, then asks for the next one. Keep pasting for as long as you like;
+type ${b}q${r} when you're finished.
+
+The speakers stay off for the whole session, so nothing plays out loud while
+you work. Each song is saved as ${b}"05 Title - Artist.mp3"${r} — the number being its
+place on its own album — tagged, and trimmed to start on the music. Links you
+already recorded are recognised and skipped.
+
+  ${d}--hear${r}            play the songs out loud as they record
+  ${d}--flac${r} ${d}--wav${r}      lossless instead of 320 kbps mp3
+
+${b}Example session${r}
+  ${d}\$${r} mp3 songs
+  ${d}[0 recorded] link ▸${r} https://open.spotify.com/track/…
+    ♪ Song Title — Artist  (3:39)
+    → 03 Song Title - Artist.mp3
+  ${d}[1 recorded] link ▸${r} q
+
+You can also paste several links at once, separated by spaces, or list them on
+the command line to start: ${d}mp3 songs <link> <link>${r}
+
+Each song records in real time. Turn crossfade off in Spotify ▸ Settings ▸
+Playback, or the next song bleeds into the end of each recording.
+EOF
+    ;;
+    rec) cat <<EOF
+${b}mp3 rec${r} — record whatever this Mac is playing
+
+  ${b}mp3 rec [name]${r}
+
+Captures the system audio — anything you can hear, from any app. Press
+${b}Return${r} (or Ctrl-C) to stop. Without a name the file is timestamped.
+
+  ${d}--silent${r}          record without playing it through the speakers
+  ${d}--flac${r} ${d}--wav${r}      lossless instead of 320 kbps mp3
+
+${b}Examples${r}
+  mp3 rec
+  mp3 rec interview
+  mp3 rec --flac "concert bootleg"
+
+It captures the system output mix only — not the microphone.
+EOF
+    ;;
+    speakers|unmute|fix) cat <<EOF
+${b}mp3 speakers${r} — put the sound back
+
+  ${b}mp3 speakers${r}
+
+Recording routes this Mac's audio away from the speakers, and puts it back when
+it finishes — including on Ctrl-C or if the terminal window is closed. If
+something still goes wrong and the Mac ends up silent, this switches the output
+device back by hand.
+EOF
+    ;;
+    get) cat <<EOF
+${b}mp3 get${r} — download a song from YouTube and friends
+
+  ${b}mp3 get <url>${r}
+
+Grabs the best available audio, converts it to mp3, and embeds the artwork
+and metadata. Downloads a single song, not a whole playlist.
+EOF
+    ;;
+    check) cat <<EOF
+${b}mp3 check${r} — rate audio quality
+
+  ${b}mp3 check [file or folder]${r}
+
+With nothing after it, rates everything in the music folder.
+
+  ${d}★★★★★${r}  lossless, or 320 kbps mp3      ${d}★★★☆☆${r}  192–255 kbps
+  ${d}★★★★☆${r}  256–319 kbps                   ${d}★★☆☆☆${r}  128–191 kbps
+                                        ${d}★☆☆☆☆${r}  under 128 kbps
+EOF
+    ;;
+    cut) cat <<EOF
+${b}mp3 cut${r} — split a long file into equal parts
+
+  ${b}mp3 cut <file> <number of parts>${r}
+
+Lossless — it copies the audio rather than re-encoding, so nothing degrades.
+Parts land in a folder named after the original. The file name can be a
+partial match against something in the music folder.
+
+${b}Example${r}
+  mp3 cut audiobook 12
+EOF
+    ;;
+    sheet|leadsheet) cat <<EOF
+${b}mp3 sheet${r} — turn a song into a lead sheet (melody + chord symbols)
+
+  ${b}mp3 sheet <youtube url | file>${r} [--key G] [--meter 3|4] [--no-lyrics]
+
+Downloads the song, separates the voice from the band (demucs), finds the
+beat, time signature, key and chords from the band, transcribes the sung
+melody (basic-pitch) and typesets it with LilyPond. Captions, when the video
+has them, go under the notes as lyrics. About a minute a song.
+
+Writes ~/Downloads/sheets/<title>/<title>.pdf (+ .midi to play it back, + .ly
+to hand-fix) and opens the PDF. It's a first draft: key and chords are
+usually right; the melody is close but check rhythms by ear. If the time
+signature or key is wrong, rerun with --meter or --key (quick — it's cached).
+
+${b}Example${r}
+  mp3 sheet "https://www.youtube.com/watch?v=<video id>"
+EOF
+    ;;
+    edit|editor) cat <<EOF
+${b}mp3 edit${r} — listen, mark and trim in the browser
+
+  ${b}mp3 edit${r} [file]
+
+Opens an editor with every song in the music folder. Play, set a start (I)
+and an end (O), then keep only that part (K) or cut it out (⌫) — as many
+times as you like, with undo. Save (⌘S) writes "<name> (edited)" next to the
+original, losslessly; the original is never changed. Ctrl-C here to quit.
+
+${b}Example${r}
+  mp3 edit "part of a name"
+EOF
+    ;;
+    trimtop|trim) cat <<EOF
+${b}mp3 trimtop${r} — chop the front off a file
+
+  ${b}mp3 trimtop <file> <seconds>${r}
+
+Makes a new file that starts at that second and runs to the end — for lopping
+off an intro, an advert, or the silence at the top of a recording. Lossless: the
+audio is copied, not re-encoded, so nothing degrades.
+
+The original is left exactly as it was. The new file lands beside it as
+${b}"<name> (trimmed).mp3"${r}, and rerunning overwrites that copy — so it costs
+nothing to try 12 seconds, listen, and go again with 14.
+
+The time can be plain seconds or ${d}m:ss${r}. The file name can be a partial match
+against something in the music folder, subfolders included.
+
+${b}Examples${r}
+  mp3 trimtop "05 Song Title - Artist.mp3" 8
+  mp3 trimtop "part of a name" 1:12
+EOF
+    ;;
+    *) cat <<EOF
+${b}mp3${r} — record, download and tidy up music
+${d}everything lands in ${MP3_DIR}${r}
+
+${b}Record from Spotify${r}
+  ${b}mp3 song${r} <link>        one song from a Spotify link, saved as
+                        ${d}"05 Title - Artist.mp3"${r} — silent unless you ask
+  ${b}mp3 songs${r}              a session you paste link after link into,
+                        ${d}recording each one as it goes${r}
+  ${b}mp3 album${r} <link>       every song on an album, one at a time
+  ${b}mp3 playlist${r} <link>    every song in a playlist, one at a time
+
+${b}Record from Ximalaya${r}
+  ${b}mp3 mala${r} <link>        every episode of a 喜马拉雅 album, one at a
+                        ${d}time, tagged and numbered${r}
+
+${b}Record anything else${r}
+  ${b}mp3 rec${r} [name]         capture whatever this Mac is playing,
+                        ${d}Return to stop${r}
+
+${b}Download${r}
+  ${b}mp3 get${r} <url>          download a song from YouTube and friends
+
+${b}Tidy up${r}
+  ${b}mp3 check${r} [file|dir]   rate audio quality out of five stars
+  ${b}mp3 cut${r} <file> <n>     split a long file into n equal parts
+  ${b}mp3 trimtop${r} <file> <s> make a copy that starts s seconds in
+  ${b}mp3 edit${r} [file]        listen, mark and trim in the browser
+  ${b}mp3 sheet${r} <url|file>   lead sheet PDF: melody + chords
+  ${b}mp3 speakers${r}           put the sound back if a recording left it off
+  ${b}mp3${r}                    jump to the music folder
+  ${b}mp3 dir${r}                print where that is
+
+${b}Common flags${r}
+  ${d}--silent / --hear${r}      whether it plays out loud while recording
+  ${d}--flac${r} ${d}--wav${r}           lossless instead of 320 kbps mp3
+
+${b}Examples${r}
+  mp3 song "https://open.spotify.com/track/<track id>"
+  mp3 mala "https://xima.tv/<code>"
+  mp3 songs
+  mp3 rec interview
+  mp3 check
+
+${d}mp3 help <command>${r} for more on any of these ${d}— e.g. mp3 help songs${r}
+EOF
+    ;;
+  esac
+}
+
+cmd="$1"; shift 2>/dev/null
+case $cmd in
+  rec)
+    _mp3_rec "$@"
+    ;;
+  song|track|link)
+    _mp3_song "$@"
+    ;;
+  songs|queue)
+    _mp3_songs "$@"
+    ;;
+  album)
+    _mp3_album "$@"
+    ;;
+  playlist|list)
+    _mp3_playlist "$@"
+    ;;
+  mala|xima|ximalaya)
+    _mp3_mala "$@"
+    ;;
+  speakers|unmute|fix)
+    _mp3_speakers_restore
+    ;;
+  get)
+    ~/venv/bin/yt-dlp -P "$MP3_DIR" -x --no-playlist --audio-format mp3 --audio-quality 0 \
+      --embed-thumbnail --embed-metadata "$*"
+    ;;
+  check)
+    arg="$*"
+    [[ -z $arg ]] && arg=$MP3_DIR
+    if [[ -d $arg ]]; then
+      found=0
+      for file in "$arg"/*.(mp3|flac|wav|m4a|aac|ogg)(N.on); do
+        found=1
+        _mp3_rate_one "$file" "${file:t}"
+      done
+      (( found )) || echo "No audio files in $arg"
+    else
+      _mp3_rate_one "$arg"
+    fi
+    ;;
+  dir)
+    echo "$MP3_DIR"
+    ;;
+  cut)
+    _mp3_cut "$1" "$2"
+    ;;
+  trimtop|trim)
+    _mp3_trimtop "$1" "$2"
+    ;;
+  edit|editor)
+    _mp3_edit "$*"
+    ;;
+  sheet|leadsheet)
+    _mp3_sheet "$@"
+    ;;
+  help|-h|--help)
+    _mp3_help "$1"
+    ;;
+  "")
+    _mp3_help
+    ;;
+  *)
+    echo "mp3: I don't know the command '$cmd'." >&2
+    echo >&2
+    _mp3_help >&2
+    exit 1
+    ;;
+esac

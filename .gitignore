@@ -1,0 +1,33 @@
+# built by ./build.sh
+bin/blackrec
+bin/audiodev
+bin/mediakey
+
+# no audio, art or captures in the repo
+*.mp3
+*.m4a
+*.m4b
+*.flac
+*.wav
+*.aac
+*.ogg
+*.caf
+*.mp4
+*.png
+*.jpg
+*.pdf
+*.midi
+
+# yoto-web runtime: your Chrome tab id and generated scripts
+src/yoto-web/tabid
+src/yoto-web/up.js
+src/yoto-web/i.js
+src/yoto-web/m.js
+src/yoto-web/addto.js
+src/yoto-web/icons.js
+# one-off page scripts with real track names stay local
+src/yoto-web/d.js
+
+__pycache__/
+.venv/
+.DS_Store

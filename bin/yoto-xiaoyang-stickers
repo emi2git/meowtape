@@ -1,4 +1,0 @@
-#!/bin/zsh
-# yoto-xiaoyang-stickers — see src/yoto_xiaoyang_stickers.py. Runs in the project's .venv (./build.sh makes it).
-py=${0:A:h:h}/.venv/bin/python; [[ -x $py ]] || py=python3
-exec $py ${0:A:h:h}/src/yoto_xiaoyang_stickers.py "$@"

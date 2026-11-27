@@ -1,9 +1,10 @@
 # Emi MP3
 
-Small macOS tools that get music and audiobooks onto kids' devices: record
-songs from Spotify and episodes from Ximalaya **silently**, download, trim and
-check tracks, then turn each folder into a **Yoto card** (tracks, cover and
-pixel icon) or copy it to an iPad or phone.
+Small macOS tools that get music and audiobooks into plain mp3 folders for
+kids' devices: record songs from Spotify and episodes from Ximalaya
+**silently**, download, trim, edit and check tracks. Each finished folder goes
+to a Yoto card, an iPad or a phone (the Yoto upload and card-art tools live
+in [meowscript](https://github.com/emi2git/meowscript) `yoto/`).
 
 Why: a Yoto player and offline devices need plain audio files, sorted the way
 a card plays. Doing that by hand, one song at a time, while the Mac blares the
@@ -27,7 +28,6 @@ mp3/                          MP3_DIR (default: SynologyDrive …/mp3)
 ├── Audiobooks/
 │   └── <Book>/
 │       └── 01 Chapter.mp3
-└── .yoto-art/<Card name>/    icon.png (16×16), cover.png, preview.png
 ```
 
 Card folder names must make sense on their own ("Vietnamese 2000s", not
@@ -42,7 +42,6 @@ Card folder names must make sense on their own ("Vietnamese 2000s", not
 - Spotify desktop app for `mp3 song/songs/album/playlist`
 - yt-dlp at `~/venv/bin/yt-dlp` for `mp3 get` and `mp3 sheet`
 - 喜马拉雅 app for `mp3 mala` (plus Accessibility permission for the media keys)
-- Google Chrome with a my.yotoplay.com tab for the `yoto-*` upload tools
 - optional: a Python with demucs + basic-pitch + librosa for `mp3 sheet`
   (point `MP3_SHEET_PY` at it)
 
@@ -89,21 +88,6 @@ mp3 dir                      # print MP3_DIR
 Spotify recordings run in real time and are trimmed to the track's exact
 length. Turn crossfade off in Spotify. `--flac` / `--wav` give lossless files.
 
-### Yoto cards
-
-```sh
-yoto-card-art [out]                  # 16×16 icon + cover per song card → $MP3_DIR/.yoto-art
-yoto-xiaoyang-icons [out] [n]        # numbered lamb icons for the 小羊上山 cards
-yoto-xiaoyang-stickers [folder]      # printable card stickers from box-set photos
-yoto-serve                           # serve MP3_DIR on 127.0.0.1:8766 for the Yoto page
-yoto-card "<Card name>"              # make a Yoto playlist from Music/<Card name> with art
-yoto-addto <card code> "<Card name>" <file>…   # add tracks to an existing card
-```
-
-`yoto-card` / `yoto-addto` drive your own logged-in my.yotoplay.com tab in
-Chrome (View ▸ Developer ▸ Allow JavaScript from Apple Events). Put that tab's
-id in `src/yoto-web/tabid` (git-ignored).
-
 ### Low-level helpers
 
 ```sh
@@ -117,12 +101,11 @@ loopend capture.caf [--min 30]                    # where a looping recording st
 ## Project layout
 
 ```
-bin/            entry points (mp3, yoto-*, spotify-tracks, loopend) + built Swift tools
-src/            blackrec.swift, audiodev.swift, mediakey.swift, loopend.py, yoto_*.py
+bin/            entry points (mp3, spotify-tracks, loopend) + built Swift tools
+src/            blackrec.swift, audiodev.swift, mediakey.swift, loopend.py
 src/mp3edit/    the `mp3 edit` browser editor (server.py + editor.html)
 src/sheet/      the `mp3 sheet` pipeline
-src/yoto-web/   my.yotoplay.com automation (card.sh, addto.sh, page scripts)
-build.sh        compile the Swift tools, set up .venv
+build.sh        compile the Swift tools, set up .venv (numpy for loopend)
 ```
 
 No audio, art, song lists or library data belong in this repo; `.gitignore`

@@ -1,6 +1,0 @@
-#!/bin/zsh
-# yoto-card "<card folder>" — make one Yoto playlist from Music/<card folder>,
-# with its cover and icon (from yoto-card-art). Needs yoto-serve running and a
-# my.yotoplay.com tab in Chrome whose id is in src/yoto-web/tabid.
-[[ $1 == (-h|--help|) ]] && { sed -n '2,4p' ${0:A}; echo "usage: yoto-card \"<card folder>\""; exit 0 }
-exec ${0:A:h:h}/src/yoto-web/card.sh "$@"

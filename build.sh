@@ -13,9 +13,9 @@ for t in blackrec audiodev mediakey; do
   fi
 done
 
-# Python helpers (Yoto art, loopend) run in .venv
+# Python helper (loopend) runs in .venv
 if [[ ! -x .venv/bin/python ]]; then
-  echo "python  .venv (numpy, pillow)"
+  echo "python  .venv (numpy)"
   python3 -m venv .venv
 fi
 .venv/bin/python -m pip install -q --disable-pip-version-check -r requirements.txt

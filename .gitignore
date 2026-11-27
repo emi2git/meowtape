@@ -18,16 +18,6 @@ bin/mediakey
 *.pdf
 *.midi
 
-# yoto-web runtime: your Chrome tab id and generated scripts
-src/yoto-web/tabid
-src/yoto-web/up.js
-src/yoto-web/i.js
-src/yoto-web/m.js
-src/yoto-web/addto.js
-src/yoto-web/icons.js
-# one-off page scripts with real track names stay local
-src/yoto-web/d.js
-
 __pycache__/
 .venv/
 .DS_Store
